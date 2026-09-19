@@ -1,0 +1,7 @@
+﻿services:
+  db:
+    ports: ["5452:5432"]
+  api:
+    ports: ["9110:9100"]
+  frontend:
+    ports: ["4110:80"]
