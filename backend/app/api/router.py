@@ -1,4 +1,5 @@
 import threading
+import uuid
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Response
@@ -13,6 +14,7 @@ from app.schemas.schemas import (
     HallOut,
     HoldOut,
     HoldRequest,
+    ReplayOut,
     SeatMapCell,
     SeatMapOut,
     ShowtimeOut,
@@ -135,13 +137,41 @@ def list_conflicts(db: Session = Depends(get_db)):
     return db.scalars(select(ConflictLog).order_by(ConflictLog.id.desc())).all()
 
 
+@api_router.get("/replays", response_model=list[ReplayOut])
+def list_replays(db: Session = Depends(get_db)):
+    """Replayed idempotency keys — distinct from conflict logs.
+
+    Only records with replay_count > 0 are returned. A replay points at the
+    already-existing hold it returned and never occupied an extra seat.
+    """
+    recs = db.scalars(
+        select(IdempotencyRecord).where(IdempotencyRecord.replay_count > 0)
+    ).all()
+    out: list[ReplayOut] = []
+    for r in recs:
+        hold = db.get(SeatHold, r.hold_id)
+        out.append(
+            ReplayOut(
+                idempotency_key=r.idempotency_key,
+                showtime_id=r.showtime_id,
+                party_size=r.party_size,
+                order_code=hold.order_code if hold else "(已删除)",
+                replay_count=r.replay_count,
+                created_at=r.created_at,
+                last_replayed_at=r.replayed_at,
+            )
+        )
+    # newest replay first; sort in Python to stay portable across SQLite/Postgres
+    out.sort(key=lambda x: (x.last_replayed_at or x.created_at), reverse=True)
+    return out
+
+
 @api_router.post("/holds", response_model=HoldOut)
 def create_hold(body: HoldRequest, response: Response, db: Session = Depends(get_db)):
     # No key: legacy non-idempotent behaviour, every request occupies fresh seats.
     if not body.idempotency_key:
         return _allocate_hold(db, body)
 
-    return _allocate_hold(db, body)
     key = body.idempotency_key
     # Re-check under a per-key lock so concurrent identical submits cannot both
     # allocate; the second one replays the hold created by the first.
@@ -149,10 +179,14 @@ def create_hold(body: HoldRequest, response: Response, db: Session = Depends(get
         rec = db.scalar(select(IdempotencyRecord).where(IdempotencyRecord.idempotency_key == key))
         if rec is not None:
             mismatch = _fingerprint_mismatch(rec, body)
+            if mismatch:
+                # 同键但场次/人数/偏好排不同：拒绝，绝不改写已有持座的坐标。
+                raise HTTPException(
+                    422,
+                    f"幂等键参数冲突：该键已绑定{mismatch}，不能复用为"
+                    f"场次{body.showtime_id}/人数{body.party_size}/偏好排{body.preferred_row or '无'}",
+                )
             hold = db.get(SeatHold, rec.hold_id)
-            if mismatch and hold is not None:
-                hold.party_size = body.party_size
-                hold.showtime_id = body.showtime_id
             if hold is None:  # defensive: record without hold should never happen
                 raise HTTPException(410, "幂等键对应的持座已不存在")
             rec.replay_count += 1
@@ -177,6 +211,14 @@ def create_hold(body: HoldRequest, response: Response, db: Session = Depends(get
                 )
             )
             db.commit()
+        except HTTPException:
+            # Genuine allocation failure (409/404). _allocate_hold has already
+            # committed the ConflictLog and added no SeatHold; no idempotency
+            # record exists yet either, so the same key stays unbound and is free
+            # for a later legal retry. Rollback is a defensive no-op that clears
+            # anything still pending before propagating the error.
+            db.rollback()
+            raise
         except IntegrityError:
             # Another process/worker won the race for this key between our
             # SELECT and INSERT — replay its result instead of double booking.
@@ -225,6 +267,14 @@ def _allocate_hold(db: Session, body: HoldRequest, commit: bool = True) -> SeatH
     Conflict logs are written on every genuine failure (including a retry that
     fails again) but never on idempotent replays, so the conflict history lets
     operators compare real-failure retries against replays.
+
+    When commit=False the caller owns the *success* transaction: the allocated
+    hold is only flushed (so hold.id is available for the idempotency-record
+    FK), and "allocate + idempotency record" commit together. The failure path
+    is different: by the time allocation gives up no hold has been added (the
+    overlap/no-capacity checks run before insertion), so the only pending
+    object is the ConflictLog, which is committed on its own. That keeps a
+    genuine failure visible even though the idempotency key stays unbound.
     """
     st = db.get(Showtime, body.showtime_id)
     if not st:
@@ -247,30 +297,34 @@ def _allocate_hold(db: Session, body: HoldRequest, commit: bool = True) -> SeatH
         )
     if block is None:
         block = find_bond_across_rows(seats_by_row, holds, body.party_size)
-    if block is None:
+
+    def _fail(reason: str, detail: str) -> None:
         db.add(
             ConflictLog(
                 showtime_id=body.showtime_id,
                 party_size=body.party_size,
-                reason=f"无足够连续空座（人数 {body.party_size}）",
+                reason=reason,
             )
         )
+        # No SeatHold has been added at this point (all checks precede
+        # insertion), so committing persists only the ConflictLog.
         db.commit()
-        raise HTTPException(409, "无足够连续空座")
+        raise HTTPException(409, detail)
+
+    if block is None:
+        _fail(f"无足够连续空座（人数 {body.party_size}）", "无足够连续空座")
 
     hits = conflicts_with(holds, block)
     if hits:
-        db.add(
-            ConflictLog(
-                showtime_id=body.showtime_id,
-                party_size=body.party_size,
-                reason=f"与既有持座重叠：第{hits[0].row}排 {hits[0].start_col}-{hits[0].end_col}",
-            )
+        _fail(
+            f"与既有持座重叠：第{hits[0].row}排 {hits[0].start_col}-{hits[0].end_col}",
+            "与既有持座冲突",
         )
-        db.commit()
-        raise HTTPException(409, "与既有持座冲突")
 
-    code = f"SB-{int(datetime.utcnow().timestamp()) % 100000:05d}"
+    # timestamp alone collides for two different keys submitted in the same
+    # second, which made two legitimate orders collapse onto one order code;
+    # append a short random suffix so each allocation gets a distinct code.
+    code = f"SB-{int(datetime.utcnow().timestamp()) % 100000:05d}-{uuid.uuid4().hex[:6]}"
     hold = SeatHold(
         showtime_id=body.showtime_id,
         order_code=code,

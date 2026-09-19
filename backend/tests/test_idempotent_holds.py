@@ -218,3 +218,89 @@ def test_request_without_key_keeps_legacy_behaviour(client):
     with Session() as s:
         assert s.query(SeatHold).count() == 2
         assert s.query(IdempotencyRecord).count() == 0
+
+
+def test_concurrent_same_key_double_click_creates_one_hold():
+    """同键并发双提交（快速连点）：持座与幂等记录各只有一条，占用格数只涨一次。
+
+    用共享缓存内存库 + 每会话独立连接（贴近真实 Postgres 连接池），不能用
+    StaticPool：那会让两个线程共用同一条底层 sqlite 连接，一个线程的 commit
+    会终结另一连接上的事务，制造与应用无关的假错误。
+    """
+    import concurrent.futures
+
+    url = "sqlite:///file:conc_click?mode=memory&cache=shared&uri=true"
+    engine = create_engine(url, connect_args={"check_same_thread": False, "timeout": 10})
+    ConcSession = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+    Base.metadata.create_all(bind=engine)
+    keeper = engine.connect()  # keep the in-memory DB alive
+    db = ConcSession()
+    hall = Hall(name="并发厅", rows=6, cols=12, aisle_cols="6")
+    db.add(hall)
+    db.flush()
+    st = Showtime(hall_id=hall.id, film_title="并发片", start_at=datetime(2026, 10, 2, 10, 0))
+    db.add(st)
+    db.commit()
+    sid = st.id
+    db.close()
+
+    def conc_get_db():
+        s = ConcSession()
+        try:
+            yield s
+        finally:
+            s.close()
+
+    app.dependency_overrides[get_db] = conc_get_db
+    c = TestClient(app)
+    try:
+        body = {"showtime_id": sid, "party_size": 2, "idempotency_key": "k-conc-0030"}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+            rs = list(ex.map(lambda _: c.post("/api/holds", json=body), range(2)))
+        codes = [r.status_code for r in rs]
+        assert codes == [200, 200]
+        flags = sorted(r.headers["X-Idempotent-Replay"] for r in rs)
+        assert flags == ["false", "true"]
+        assert rs[0].json()["id"] == rs[1].json()["id"]
+        with ConcSession() as s:
+            assert s.query(SeatHold).count() == 1
+            assert s.query(IdempotencyRecord).count() == 1
+        assert sum(1 for cell in c.get(f"/api/seatmap/{sid}").json()["cells"] if cell["occupied"]) == 2
+    finally:
+        app.dependency_overrides.clear()
+        keeper.close()
+
+
+def test_replays_endpoint_separates_replay_from_conflicts(client):
+    """/replays 只列出被重放过的键；未重放的键和真失败都不出现在其中。"""
+    c, _, (sid, _) = client
+    # 一次真失败（不绑定键）
+    c.post("/api/holds", json={"showtime_id": sid, "party_size": 6, "idempotency_key": "k-rp-0040"})
+    # 一次成功 + 一次重放
+    body = {"showtime_id": sid, "party_size": 2, "idempotency_key": "k-rp-0041"}
+    ok = c.post("/api/holds", json=body)
+    rp = c.post("/api/holds", json=body)
+    assert ok.status_code == 200 and rp.status_code == 200
+    rows = c.get("/api/replays").json()
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["idempotency_key"] == "k-rp-0041"
+    assert row["replay_count"] == 1
+    assert row["order_code"] == ok.json()["order_code"]
+    assert row["party_size"] == 2
+    assert row["last_replayed_at"] is not None
+
+
+def test_distinct_keys_in_same_second_get_distinct_order_codes(client):
+    """不同键同秒提交不得共用单号（否则订单页误判为一单）。"""
+    c, _, (sid, _) = client
+    r1 = c.post(
+        "/api/holds",
+        json={"showtime_id": sid, "party_size": 2, "idempotency_key": "k-code-0050"},
+    )
+    r2 = c.post(
+        "/api/holds",
+        json={"showtime_id": sid, "party_size": 2, "idempotency_key": "k-code-0051"},
+    )
+    assert r1.status_code == 200 and r2.status_code == 200
+    assert r1.json()["order_code"] != r2.json()["order_code"]

@@ -50,6 +50,24 @@ class ConflictOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class ReplayOut(BaseModel):
+    """An idempotency record that has been replayed at least once.
+
+    Replays occupy no seats and are NOT conflicts; they are surfaced alongside
+    the conflict log so operators can tell a genuine failed retry apart from a
+    successful replay of an existing hold.
+    """
+
+    idempotency_key: str
+    showtime_id: int
+    party_size: int
+    order_code: str
+    replay_count: int
+    created_at: datetime
+    last_replayed_at: datetime | None
+    model_config = {"from_attributes": True}
+
+
 class SeatMapCell(BaseModel):
     row: int
     col: int
