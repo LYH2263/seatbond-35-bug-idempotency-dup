@@ -141,7 +141,6 @@ def create_hold(body: HoldRequest, response: Response, db: Session = Depends(get
     if not body.idempotency_key:
         return _allocate_hold(db, body)
 
-    return _allocate_hold(db, body)
     key = body.idempotency_key
     # Re-check under a per-key lock so concurrent identical submits cannot both
     # allocate; the second one replays the hold created by the first.
@@ -149,10 +148,15 @@ def create_hold(body: HoldRequest, response: Response, db: Session = Depends(get
         rec = db.scalar(select(IdempotencyRecord).where(IdempotencyRecord.idempotency_key == key))
         if rec is not None:
             mismatch = _fingerprint_mismatch(rec, body)
+            if mismatch:
+                # Same key but a different intent: reject, never rewrite the
+                # existing hold's coordinates, and do not count as a replay.
+                raise HTTPException(
+                    422,
+                    f"幂等键参数冲突：该键已绑定{mismatch}，不能复用为"
+                    f"场次{body.showtime_id}/人数{body.party_size}/偏好排{body.preferred_row or '无'}",
+                )
             hold = db.get(SeatHold, rec.hold_id)
-            if mismatch and hold is not None:
-                hold.party_size = body.party_size
-                hold.showtime_id = body.showtime_id
             if hold is None:  # defensive: record without hold should never happen
                 raise HTTPException(410, "幂等键对应的持座已不存在")
             rec.replay_count += 1
@@ -270,19 +274,20 @@ def _allocate_hold(db: Session, body: HoldRequest, commit: bool = True) -> SeatH
         db.commit()
         raise HTTPException(409, "与既有持座冲突")
 
-    code = f"SB-{int(datetime.utcnow().timestamp()) % 100000:05d}"
     hold = SeatHold(
         showtime_id=body.showtime_id,
-        order_code=code,
+        order_code="",  # placeholder, replaced by the id-based code below
         row=block.row,
         start_col=block.start_col,
         end_col=block.end_col,
         party_size=body.party_size,
     )
     db.add(hold)
+    db.flush()  # populate hold.id (also the FK target of the idempotency record)
+    # Derive the order code from the unique hold id: two holds can never share
+    # a 单号, even when created within the same second.
+    hold.order_code = f"SB-{hold.id:05d}"
     if commit:
         db.commit()
         db.refresh(hold)
-    else:
-        db.flush()  # populate hold.id for the idempotency record FK
     return hold
